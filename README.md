@@ -2,55 +2,68 @@
 
 ランサムウェアグループの.onionサイトと被害者情報を収集・監視するツール
 
-## 使い方
+## Install
 
-### init
+### 動作環境
 
-DBを初期化する。
+- Linux (Ubuntu 22.04+, Kali Linux)
+- macOS
+
+### 必要なツール
+
+- Rust (1.70+)
+- Cargo
+
+### インストール手順
 
 ```bash
-$ torsearch init
-データベースを初期化中...
-完了: data/torsearch.db
+# Rustのインストール（未インストールの場合）
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# リポジトリのクローン
+git clone https://github.com/xxx/TorSearch.git
+cd TorSearch
+
+# ビルド
+cargo build --release
+
+# 実行（初回はsyncでデータ取得）
+./target/release/torsearch sync
 ```
 
-- 処理: `design/sqlite-ddl.sql` を読み込んで `data/torsearch.db` に適用
-- 冪等性: 既存DBがあればスキップ
+## 使い方
 
-### sync
+### 初回＆都度データ更新
 
-APIからデータを取得しDBに保存する。
+APIからデータを取得しDBに保存する。初回実行時はDBを自動作成。
 
 ```bash
 $ torsearch sync
+データベースを初期化中...
+完了: data/torsearch.db
+
 グループ情報を同期中...
   ransomware.live: 351 グループ取得
   ransomlook.io: 連絡先情報を補完中... 351/351
 被害者情報を同期中...
   ransomware.live: 100 件取得
-同期完了: 351 グループ, 723 URL, 100 被害者
+ランサムノートを取得中...
+  ransomware.live: 339 ノート取得
+同期完了: 351 グループ, 723 URL, 100 被害者, 339 ノート
 ```
-
-- 処理:
-  1. ransomware.live `/groups` → グループ名、locations取得
-  2. ransomlook.io `/group/{name}` → 各グループのTOX、Telegram、PGP、profile補完
-  3. ransomware.live `/recentvictims` → 被害者情報取得
-  4. ransomware.live `/ransomnotes` ページをスクレイピング → グループ別ノートURL取得
-  5. DBに統合保存（UPSERT）
-- レート制限対策:
-  - ransomware.live: 2エンドポイント使用、間に60秒待機
-  - ransomlook.io: 緩いが念のため100ms間隔
 
 ### 運用
 
-DBからデータを参照する。結果表示はsearchsploit風。
-
 #### groups
 
-最近のグループ活動一覧を表示。
+- 最近のグループ活動一覧を表示。
+  - 処理: DBから最終活動日順にグループ取得
+  - 引数: `-N` 件数指定（デフォルト20）
+
 
 ```bash
 $ torsearch groups -20
+
 -------------------------------------------------------------------
  ID  | Group              | Victims | Last Activity | DLS Sites
 -------------------------------------------------------------------
@@ -59,11 +72,11 @@ $ torsearch groups -20
 -------------------------------------------------------------------
 ```
 
-- 処理: DBから最終活動日順にグループ取得
-- 引数: `-N` 件数指定（デフォルト20）
+- 処理: グループ名で部分一致検索
 
 ```bash
 $ torsearch groups lock
+
 -------------------------------------------------------------------
  ID  | Group              | Victims | Last Activity | DLS Sites
 -------------------------------------------------------------------
@@ -72,21 +85,61 @@ $ torsearch groups lock
 -------------------------------------------------------------------
 ```
 
-- 処理: グループ名で部分一致検索
+- 処理: ツール別にグループ数を集計
+
+```bash
+$ torsearch groups --by-tools
+
+-------------------------------------------------------------------
+ Tool                                              | Groups
+-------------------------------------------------------------------
+ Exfiltration: RClone                              | 45
+ CredentialTheft: Mimikatz                         | 42
+ LOLBAS: PsExec                                    | 38
+-------------------------------------------------------------------
+```
+
+- 処理: TTPs別にグループ数を集計
+
+```bash
+$ torsearch groups --by-ttps
+
+-------------------------------------------------------------------
+ TTP                                               | Groups
+-------------------------------------------------------------------
+ T1486 Data Encrypted for Impact                   | 52
+ T1490 Inhibit System Recovery                     | 48
+ T1078 Valid Accounts                              | 45
+-------------------------------------------------------------------
+```
+
+- グループの詳細を表示
 
 ```bash
 $ torsearch groups {id}
-詳細表示。ＴＯＤＯ項目
 ```
 
-- 処理: 指定されたidで詳細表示
+```markdown
+# akira
+
+> ID: 38
+
+## Description
+
+Akira is a ransomware group first observed in March 2023...
+
+## References
+- https://www.sentinelone.com/labs/akira-ransomware-attacks-vpn-appliances
+...
+```
 
 #### victims
 
-被害者一覧を表示。
+- 被害者一覧を表示。
 
 ```bash
 $ torsearch victims -50
+
 -------------------------------------------------------------------
  ID   | Victim                    | Group          | Country | Date
 -------------------------------------------------------------------
@@ -95,19 +148,45 @@ $ torsearch victims -50
 -------------------------------------------------------------------
 ```
 
+- 被害者の詳細を表示。
+  - 処理: DBから発見日順に被害者取得
+  - 引数: `-N` 件数指定（デフォルト20）
+
 ```bash
-$ torsearch victims -50 {id}
-詳細表示。ＴＯＤＯ項目
+$ torsearch victims {id}
 ```
 
-- 処理: 指定されたidで詳細表示
+```markdown
+# Aptora
 
-- 処理: DBから発見日順に被害者取得
-- 引数: `-N` 件数指定（デフォルト20）
-- オプション: `--by-country` 国別集計
+> ID: 101
+
+## Basic Info
+
+| Field | Value |
+|-------|-------|
+| Group | dragonforce |
+| Country | US |
+| Activity | Technology |
+| Discovered | 2026-06-27 |
+
+## Description
+
+Aptora is a technology company...
+
+## Links
+
+| Type | URL |
+|------|-----|
+| Post URL | http://xxx.onion/... |
+| Website | https://aptora.com |
+```
+
+- 被害国の一覧
 
 ```bash
 $ torsearch victims --by-country
+
 -------------------------------------------------------------------
  Country | Count
 -------------------------------------------------------------------
@@ -116,138 +195,8 @@ $ torsearch victims --by-country
 -------------------------------------------------------------------
 ```
 
+## 設計
 
----
-
-## API仕様
-
-### ベースURL
-
-| API | ベースURL | 認証 | レート制限 |
-|-----|-----------|------|------------|
-| ransomware.live v2 | `https://api.ransomware.live/v2` | 不要 | 1 req/min/endpoint |
-| ransomware.live PRO | `https://api-pro.ransomware.live` | APIキー必要 | 無制限 (fair use) |
-| ransomlook.io | `https://www.ransomlook.io/api` | 不要 | 緩い |
-
-> **注意**: ransomware.live v1は非推奨 (Legacy compatibility only)。v2を使用すること。
-> OpenCTIコネクタが2025年8月にAPI仕様変更で停止した事例あり。定期的な動作確認を推奨。
-
-### エンドポイント比較
-
-| 機能 | ransomware.live (v2) | ransomlook.io |
-|------|----------------------|---------------|
-| グループ一覧 | `/groups` | ❌ (グループ単体取得のみ) |
-| グループ詳細 | `/group/{name}` | `/group/{name}` |
-| グループ別被害者 | `/groupvictims/{name}` | ❌ |
-| 最新被害者 | `/recentvictims` | `/posts?days=N` |
-| 被害者検索 | `/searchvictims/{keyword}` | `/search?query=xxx` |
-| 国別被害者 | `/countryvictims/{code}` | ❌ |
-| 業種別被害者 | `/sectorvictims/{sector}` | ❌ |
-| 年月別被害者 | `/victims/{year}/{month}` | ❌ |
-| サイバー攻撃 | `/recentcyberattacks` | ❌ |
-| 国別攻撃 | `/countrycyberattacks/{code}` | ❌ |
-| YARA | `/yara/{group}` | ❌ |
-| DBエクスポート | ❌ | `/export/{db_num}` (要APIキー) |
-
-### 取得可能データ比較
-
-#### 被害者情報 (victims)
-
-| データ | ransomware.live | ransomlook.io | 備考 |
-|--------|:---------------:|:-------------:|------|
-| 被害者名 | ✅ `post_title` | ✅ `post_title` | |
-| グループ名 | ✅ `group_name` | ✅ `group_name` | |
-| **国情報** | ✅ `country` | ❌ | ransomware.live独自 |
-| **業種** | ✅ `activity` | ❌ | ransomware.live独自 |
-| 発見日時 | ✅ `discovered` | ✅ `discovered` | |
-| **被害者説明** | ✅ `description` | ✅ `description` | 両方あり |
-| **被害者ページURL** | ✅ `post_url` (.onion) | ✅ `link` (相対パス) | ransomware.liveは直接.onion |
-| **スクリーンショット** | ✅ `screenshot` (https) | ✅ `screen` (path) | ransomware.liveはCDN URL |
-| **被害者サイト** | ✅ `website` | ❌ | ransomware.live独自 |
-| **Infostealer情報** | ✅ `infostealer{}` | ❌ | 漏洩従業員数など |
-| **データサイズ** | ⚠️ `data_size` (通常null) | ❌ | ransomware.live独自 |
-| 身代金額 | ⚠️ `ransom` (通常null) | ❌ | |
-| Magnetリンク | ❌ | ⚠️ `magnet` (通常null) | |
-
-#### グループ情報 (groups)
-
-| データ | ransomware.live | ransomlook.io | 備考 |
-|--------|:---------------:|:-------------:|------|
-| グループ名 | ✅ `name` | ✅ (配列のみ) | ransomlookはリストのみ |
-| **TOX ID** | ❌ | ✅ `tox` | ransomlook独自 |
-| **Telegram (連絡先)** | ❌ | ✅ `telegram` | ransomlook独自 |
-| **Jabber** | ❌ | ✅ `jabber` | ransomlook独自 |
-| **PGP鍵** | ❌ | ✅ `pgp` | ransomlook独自 |
-| **プロファイル** | ❌ | ✅ `profile[]` | 関連記事URL |
-
-#### サイトURL情報 (groups.locations[])
-
-グループに紐づく.onionサイト情報。**各タイプ複数存在しうる**（ミラー、冗長化）
-
-| タイプ | 説明 | ransomware.live | ransomlook.io |
-|--------|------|:---------------:|:-------------:|
-| **DLS** | Data Leak Site (被害者データ公開) | ✅ `type:"DLS"` | ⚠️ `chat:false` で推定 |
-| **Chat** | 身代金交渉チャット | ✅ `type:"Chat"` | ✅ `chat:true` |
-| **Files** | ファイル共有/ダウンロード | ✅ `type:"Files"` | ❌ |
-| **Admin** | 管理者パネル | ✅ `type:"Admin"` | ❌ |
-| **API** | APIエンドポイント | ✅ `type:"API"` | ❌ |
-| **Telegram** | Telegramチャンネル | ✅ `type:"Telegram"` | ❌ |
-
-各URLエントリのフィールド:
-
-| フィールド | ransomware.live | ransomlook.io | 内容 |
-|-----------|:---------------:|:-------------:|------|
-| `slug` | ✅ | ✅ | 完全URL (`http://xxx.onion/path`) |
-| `fqdn` | ✅ | ✅ | ドメインのみ (`xxx.onion`) |
-| `title` | ✅ | ✅ | サイトタイトル |
-| `available` | ✅ | ✅ | 稼働状況 |
-| `updated` | ✅ | ✅ | 最終更新日時 (※DBスキーマ: `last_checked_at`) |
-| `screen` | ❌ | ✅ | スクリーンショット (base64) |
-
-### 精度向上ポイント
-
-1. **被害者情報**: ransomware.liveから取得（国・業種・Webサイト・スクリーンショット）。ransomlook.ioの`/posts`にはdescriptionがないため統合不可。
-2. **連絡先**: ransomlookのTOX/Telegram/PGP情報
-3. **URL**: ransomware.liveの`post_url`で直接.onionリンク取得可能
-4. **スクリーンショット**: ransomware.liveはCDN経由で取得容易
-
----
-
-## データベーススキーマ
-
-詳細は `sqlite.ddl` 参照
-
-```
-groups (グループ)
-├── id, name
-├── tox_id, telegram, jabber, pgp  -- 連絡先 (ransomlook)
-├── profile                         -- 関連記事URL (JSON)
-│
-├─< group_locations (サイトURL) 1:N
-│   ├── type            -- DLS, Chat, Files, Admin, API, Telegram
-│   ├── slug            -- 完全URL
-│   ├── fqdn            -- ドメインのみ
-│   ├── title           -- ページタイトル
-│   ├── available       -- 稼働状況
-│   └── last_checked_at -- 最終確認日時 (API: updated)
-│
-├─< ransom_notes (ランサムノート) 1:N
-│   ├── filename        -- RESTORE-MY-FILES.txt等
-│   ├── file_type       -- txt, html, hta
-│   └── url             -- ダウンロードURL
-│
-└─< victims (被害者) 1:N
-    ├── post_title      -- 被害者名
-    ├── country         -- 国コード
-    ├── activity        -- 業種
-    ├── description     -- 説明
-    ├── post_url        -- 被害者ページ.onion URL
-    ├── website         -- 被害者の通常サイト
-    ├── screenshot_url  -- スクリーンショット
-    ├── data_size       -- 漏洩データサイズ
-    ├── ransom          -- 身代金額
-    ├── discovered_at   -- 発見日時 (ransomware.live: discovered)
-    └── published_at    -- 公開日時 (ransomlook: published)
-```
-
----
+- [API仕様](./design/api.md)
+- [データベーススキーマ](./design/sqlite-ddl.sql)
+- [帳票](./design/templates)

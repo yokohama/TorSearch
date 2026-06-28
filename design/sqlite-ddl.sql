@@ -5,11 +5,13 @@
 CREATE TABLE groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
+    description TEXT,  -- グループ説明 (ransomware.live) + 関連記事URL (ransomlook profile)
+    tools TEXT,        -- 使用ツール (JSON配列)
+    ttps TEXT,         -- TTPs (JSON配列)
     tox_id TEXT,
     telegram TEXT,
     jabber TEXT,
     pgp TEXT,
-    profile TEXT,  -- JSON array of profile URLs
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );

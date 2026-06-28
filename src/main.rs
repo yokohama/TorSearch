@@ -5,6 +5,8 @@ mod sync;
 
 const DB_PATH: &str = "data/torsearch.db";
 const SCHEMA_PATH: &str = "design/sqlite-ddl.sql";
+const TEMPLATE_GROUP_DETAIL: &str = "design/templates/group_detail.md";
+const TEMPLATE_VICTIM_DETAIL: &str = "design/templates/victim_detail.md";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -15,7 +17,6 @@ fn main() {
     }
 
     match args[1].as_str() {
-        "init" => cmd_init(),
         "sync" => cmd_sync(),
         "groups" => cmd_groups(&args[2..]),
         "victims" => cmd_victims(&args[2..]),
@@ -27,49 +28,41 @@ fn print_usage() {
     println!("Usage: torsearch <command> [options]");
     println!();
     println!("Commands:");
-    println!("  init              DBを初期化");
-    println!("  sync              APIからデータを同期");
-    println!("  groups [-N] [id]  グループ一覧/詳細");
+    println!("  sync              APIからデータを同期 (初回はDB自動作成)");
+    println!("  groups [-N] [id]  グループ一覧/詳細/検索");
+    println!("  groups --by-tools     ツール別集計");
+    println!("  groups --by-ttps      TTPs別集計");
     println!("  victims [-N] [id] 被害者一覧/詳細");
     println!("  victims --by-country  国別集計");
 }
 
-fn cmd_init() {
-    if Path::new(DB_PATH).exists() {
-        println!("データベースは既に存在します: {}", DB_PATH);
-        return;
-    }
-
-    println!("データベースを初期化中...");
-
-    let schema = match fs::read_to_string(SCHEMA_PATH) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("スキーマファイル読み込みエラー: {}", e);
-            return;
-        }
-    };
-
-    let conn = match rusqlite::Connection::open(DB_PATH) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("DB接続エラー: {}", e);
-            return;
-        }
-    };
-
-    if let Err(e) = conn.execute_batch(&schema) {
-        eprintln!("スキーマ適用エラー: {}", e);
-        return;
-    }
-
-    println!("完了: {}", DB_PATH);
-}
-
 fn cmd_sync() {
+    // DBがなければ自動でinit
     if !Path::new(DB_PATH).exists() {
-        eprintln!("エラー: データベースが存在しません。先に init を実行してください。");
-        return;
+        println!("データベースを初期化中...");
+
+        let schema = match fs::read_to_string(SCHEMA_PATH) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("スキーマファイル読み込みエラー: {}", e);
+                return;
+            }
+        };
+
+        let conn = match rusqlite::Connection::open(DB_PATH) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("DB接続エラー: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = conn.execute_batch(&schema) {
+            eprintln!("スキーマ適用エラー: {}", e);
+            return;
+        }
+        println!("完了: {}", DB_PATH);
+        println!();
     }
 
     let conn = match rusqlite::Connection::open(DB_PATH) {
@@ -99,6 +92,18 @@ fn cmd_groups(args: &[String]) {
             return;
         }
     };
+
+    // --by-tools オプション
+    if args.iter().any(|a| a == "--by-tools") {
+        show_tools_summary(&conn);
+        return;
+    }
+
+    // --by-ttps オプション
+    if args.iter().any(|a| a == "--by-ttps") {
+        show_ttps_summary(&conn);
+        return;
+    }
 
     let (limit, id, keyword) = parse_args(args, 20);
 
@@ -161,13 +166,21 @@ fn cmd_groups(args: &[String]) {
 }
 
 fn show_group_detail(conn: &rusqlite::Connection, group_id: usize) {
-    let result: Result<(String, Option<String>, Option<String>, Option<String>, Option<String>), _> = conn.query_row(
-        "SELECT name, tox_id, telegram, jabber, pgp FROM groups WHERE id = ?1",
+    let template = match fs::read_to_string(TEMPLATE_GROUP_DETAIL) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("テンプレート読み込みエラー: {}", e);
+            return;
+        }
+    };
+
+    let result: Result<(String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>), _> = conn.query_row(
+        "SELECT name, tox_id, telegram, jabber, pgp, description, tools, ttps FROM groups WHERE id = ?1",
         [group_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
     );
 
-    let (name, tox, telegram, jabber, pgp) = match result {
+    let (name, tox, telegram, jabber, pgp, description, tools, ttps) = match result {
         Ok(r) => r,
         Err(_) => {
             eprintln!("グループID {} が見つかりません", group_id);
@@ -175,52 +188,98 @@ fn show_group_detail(conn: &rusqlite::Connection, group_id: usize) {
         }
     };
 
-    println!("=== Group: {} (ID: {}) ===", name, group_id);
-    println!();
+    // Description
+    let description_str = description.as_deref().unwrap_or("-").to_string();
 
-    if tox.is_some() || telegram.is_some() || jabber.is_some() || pgp.is_some() {
-        println!("連絡先:");
-        if let Some(t) = tox { println!("  TOX: {}", t); }
-        if let Some(t) = telegram { println!("  Telegram: {}", t); }
-        if let Some(j) = jabber { println!("  Jabber: {}", j); }
-        if let Some(p) = pgp { println!("  PGP: {}...", p.chars().take(50).collect::<String>()); }
-        println!();
-    }
+    // Tools
+    let tools_str = if let Some(ref t) = tools {
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(t) {
+            if !arr.is_empty() {
+                let mut lines = Vec::new();
+                for obj in arr {
+                    if let Some(map) = obj.as_object() {
+                        for (category, items) in map {
+                            if let Some(arr) = items.as_array() {
+                                let tools: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                                lines.push(format!("- **{}**: {}", category, tools.join(", ")));
+                            }
+                        }
+                    }
+                }
+                if lines.is_empty() { "-".to_string() } else { lines.join("\n") }
+            } else {
+                "-".to_string()
+            }
+        } else {
+            "-".to_string()
+        }
+    } else {
+        "-".to_string()
+    };
 
-    // DLSサイト
+    // TTPs
+    let ttps_str = if let Some(ref t) = ttps {
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(t) {
+            if !arr.is_empty() {
+                let mut lines = Vec::new();
+                for tactic in arr {
+                    let tactic_name = tactic.get("tactic_name").and_then(|v| v.as_str()).unwrap_or("-");
+                    let tactic_id = tactic.get("tactic_id").and_then(|v| v.as_str()).unwrap_or("-");
+                    lines.push(format!("- **{} ({})**: ", tactic_name, tactic_id));
+                    if let Some(techniques) = tactic.get("techniques").and_then(|v| v.as_array()) {
+                        let tech_names: Vec<&str> = techniques.iter()
+                            .filter_map(|t| t.get("technique_name").and_then(|v| v.as_str()))
+                            .collect();
+                        lines.push(format!("  {}", tech_names.join(", ")));
+                    }
+                }
+                if lines.is_empty() { "-".to_string() } else { lines.join("\n") }
+            } else {
+                "-".to_string()
+            }
+        } else {
+            "-".to_string()
+        }
+    } else {
+        "-".to_string()
+    };
+
+    // Sites
     let mut stmt = conn.prepare(
-        "SELECT slug, available FROM group_locations WHERE group_id = ?1 AND type = 'DLS'"
+        "SELECT type, slug, title, available, last_checked_at FROM group_locations WHERE group_id = ?1 ORDER BY type, available DESC"
     ).unwrap();
-    let sites: Vec<(String, bool)> = stmt.query_map([group_id], |row| {
-        Ok((row.get(0)?, row.get(1)?))
+    let sites: Vec<(String, String, Option<String>, bool, Option<String>)> = stmt.query_map([group_id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
     }).unwrap().filter_map(|r| r.ok()).collect();
 
-    if !sites.is_empty() {
-        println!("DLS Sites:");
-        for (url, available) in sites {
-            let status = if available { "UP" } else { "DOWN" };
-            println!("  [{}] {}", status, url);
-        }
-        println!();
-    }
+    let sites_str = if !sites.is_empty() {
+        sites.iter().map(|(loc_type, url, title, available, last_checked)| {
+            let status = if *available { "UP" } else { "DOWN" };
+            let title_str = title.as_deref().unwrap_or("-");
+            let checked_str = last_checked.as_ref().map(|c| c[..10.min(c.len())].to_string()).unwrap_or("-".to_string());
+            format!("| {} | {} | {} | `{}` | {} |", loc_type, status, title_str, url, checked_str)
+        }).collect::<Vec<_>>().join("\n")
+    } else {
+        "| - | - | - | - | - |".to_string()
+    };
 
-    // ランサムノート
+    // Ransom Notes
     let mut stmt = conn.prepare(
-        "SELECT filename, url FROM ransom_notes WHERE group_id = ?1"
+        "SELECT filename, file_type, url FROM ransom_notes WHERE group_id = ?1"
     ).unwrap();
-    let notes: Vec<(String, String)> = stmt.query_map([group_id], |row| {
-        Ok((row.get(0)?, row.get(1)?))
+    let notes: Vec<(String, String, String)> = stmt.query_map([group_id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     }).unwrap().filter_map(|r| r.ok()).collect();
 
-    if !notes.is_empty() {
-        println!("Ransom Notes:");
-        for (filename, _url) in notes {
-            println!("  - {}", filename);
-        }
-        println!();
-    }
+    let notes_str = if !notes.is_empty() {
+        notes.iter().map(|(filename, file_type, url)| {
+            format!("| {} | {} | {} |", filename, file_type, url)
+        }).collect::<Vec<_>>().join("\n")
+    } else {
+        "| - | - | - |".to_string()
+    };
 
-    // 最近の被害者
+    // Victims
     let mut stmt = conn.prepare(
         "SELECT post_title, country, substr(discovered_at, 1, 10) FROM victims WHERE group_id = ?1 ORDER BY discovered_at DESC LIMIT 5"
     ).unwrap();
@@ -228,14 +287,32 @@ fn show_group_detail(conn: &rusqlite::Connection, group_id: usize) {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     }).unwrap().filter_map(|r| r.ok()).collect();
 
-    if !victims.is_empty() {
-        println!("Recent Victims (max 5):");
-        for (name, country, date) in victims {
-            let c = country.unwrap_or_else(|| "-".to_string());
-            let d = date.unwrap_or_else(|| "-".to_string());
-            println!("  {} [{}] {}", d, c, name);
-        }
-    }
+    let victims_str = if !victims.is_empty() {
+        victims.iter().map(|(name, country, date)| {
+            let c = country.as_deref().unwrap_or("-");
+            let d = date.as_deref().unwrap_or("-");
+            format!("| {} | {} | {} |", d, c, name)
+        }).collect::<Vec<_>>().join("\n")
+    } else {
+        "| - | - | - |".to_string()
+    };
+
+    // Replace placeholders
+    let output = template
+        .replace("{{name}}", &name)
+        .replace("{{id}}", &group_id.to_string())
+        .replace("{{tox}}", tox.as_deref().unwrap_or("-"))
+        .replace("{{telegram}}", telegram.as_deref().unwrap_or("-"))
+        .replace("{{jabber}}", jabber.as_deref().unwrap_or("-"))
+        .replace("{{pgp}}", &pgp.as_ref().map(|p| format!("{}...", p.chars().take(50).collect::<String>())).unwrap_or("-".to_string()))
+        .replace("{{description}}", &description_str)
+        .replace("{{tools}}", &tools_str)
+        .replace("{{ttps}}", &ttps_str)
+        .replace("{{sites}}", &sites_str)
+        .replace("{{ransom_notes}}", &notes_str)
+        .replace("{{victims}}", &victims_str);
+
+    print!("{}", output);
 }
 
 fn cmd_victims(args: &[String]) {
@@ -307,6 +384,14 @@ fn cmd_victims(args: &[String]) {
 }
 
 fn show_victim_detail(conn: &rusqlite::Connection, victim_id: usize) {
+    let template = match fs::read_to_string(TEMPLATE_VICTIM_DETAIL) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("テンプレート読み込みエラー: {}", e);
+            return;
+        }
+    };
+
     let result: Result<(String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>), _> = conn.query_row(
         "SELECT v.post_title, g.name, v.country, v.activity, v.description, v.post_url, v.website, v.discovered_at
          FROM victims v
@@ -324,28 +409,18 @@ fn show_victim_detail(conn: &rusqlite::Connection, victim_id: usize) {
         }
     };
 
-    println!("=== Victim: {} (ID: {}) ===", name, victim_id);
-    println!();
-    println!("Group: {}", group);
-    if let Some(c) = country { println!("Country: {}", c); }
-    if let Some(a) = activity { println!("Activity: {}", a); }
-    if let Some(d) = discovered { println!("Discovered: {}", d); }
-    println!();
+    let output = template
+        .replace("{{name}}", &name)
+        .replace("{{id}}", &victim_id.to_string())
+        .replace("{{group}}", &group)
+        .replace("{{country}}", country.as_deref().unwrap_or("-"))
+        .replace("{{activity}}", activity.as_deref().unwrap_or("-"))
+        .replace("{{discovered}}", discovered.as_deref().unwrap_or("-"))
+        .replace("{{description}}", description.as_deref().unwrap_or("-"))
+        .replace("{{post_url}}", post_url.as_deref().unwrap_or("-"))
+        .replace("{{website}}", website.as_deref().unwrap_or("-"));
 
-    if let Some(desc) = description {
-        if !desc.is_empty() {
-            println!("Description:");
-            println!("  {}", desc.chars().take(200).collect::<String>());
-            println!();
-        }
-    }
-
-    if let Some(url) = post_url {
-        println!("Post URL: {}", url);
-    }
-    if let Some(site) = website {
-        println!("Website: {}", site);
-    }
+    print!("{}", output);
 }
 
 fn parse_args(args: &[String], default_limit: usize) -> (usize, Option<usize>, Option<String>) {
@@ -366,4 +441,76 @@ fn parse_args(args: &[String], default_limit: usize) -> (usize, Option<usize>, O
     }
 
     (limit, id, keyword)
+}
+
+fn show_tools_summary(conn: &rusqlite::Connection) {
+    let mut stmt = conn.prepare("SELECT tools FROM groups WHERE tools IS NOT NULL AND tools != '[]'").unwrap();
+    let rows: Vec<String> = stmt.query_map([], |row| row.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+
+    let mut tool_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for tools_json in rows {
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&tools_json) {
+            for obj in arr {
+                if let Some(map) = obj.as_object() {
+                    for (category, items) in map {
+                        if let Some(tools) = items.as_array() {
+                            for tool in tools {
+                                if let Some(name) = tool.as_str() {
+                                    let key = format!("{}: {}", category, name);
+                                    *tool_counts.entry(key).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut sorted: Vec<_> = tool_counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+    println!("-------------------------------------------------------------------");
+    println!(" Tool                                              | Groups");
+    println!("-------------------------------------------------------------------");
+    for (tool, count) in sorted.iter().take(30) {
+        let tool_display: String = tool.chars().take(50).collect();
+        println!(" {:<50} | {}", tool_display, count);
+    }
+    println!("-------------------------------------------------------------------");
+}
+
+fn show_ttps_summary(conn: &rusqlite::Connection) {
+    let mut stmt = conn.prepare("SELECT ttps FROM groups WHERE ttps IS NOT NULL AND ttps != '[]'").unwrap();
+    let rows: Vec<String> = stmt.query_map([], |row| row.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+
+    let mut ttp_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for ttps_json in rows {
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&ttps_json) {
+            for tactic in arr {
+                if let Some(techniques) = tactic.get("techniques").and_then(|v| v.as_array()) {
+                    for tech in techniques {
+                        let id = tech.get("technique_id").and_then(|v| v.as_str()).unwrap_or("-");
+                        let name = tech.get("technique_name").and_then(|v| v.as_str()).unwrap_or("-");
+                        let key = format!("{} {}", id, name);
+                        *ttp_counts.entry(key).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut sorted: Vec<_> = ttp_counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+    println!("-------------------------------------------------------------------");
+    println!(" TTP                                               | Groups");
+    println!("-------------------------------------------------------------------");
+    for (ttp, count) in sorted.iter().take(30) {
+        let ttp_display: String = ttp.chars().take(50).collect();
+        println!(" {:<50} | {}", ttp_display, count);
+    }
+    println!("-------------------------------------------------------------------");
 }

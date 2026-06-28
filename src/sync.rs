@@ -14,6 +14,12 @@ const RANSOMNOTES_URL: &str = "https://www.ransomware.live/ransomnotes";
 pub struct RansomwareLiveGroup {
     pub name: String,
     #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub tools: Option<serde_json::Value>,
+    #[serde(default)]
+    pub ttps: Option<serde_json::Value>,
+    #[serde(default)]
     pub locations: Vec<Location>,
 }
 
@@ -36,27 +42,9 @@ pub struct Location {
 #[derive(Debug, Deserialize)]
 pub struct RansomlookGroup {
     #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
     pub meta: Option<String>,
     #[serde(default)]
-    pub locations: Option<Vec<RansomlookLocation>>,
-    #[serde(default)]
     pub profile: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RansomlookLocation {
-    #[serde(default)]
-    pub fqdn: Option<String>,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub available: Option<bool>,
-    #[serde(default)]
-    pub updated: Option<String>,
-    #[serde(default)]
-    pub slug: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,7 +114,9 @@ pub fn run_sync(conn: &Connection) -> Result<SyncStats, String> {
     let mut group_ids: HashMap<String, i64> = HashMap::new();
     let mut group_ids_lowercase: HashMap<String, i64> = HashMap::new();
     for group in &groups {
-        let group_id = upsert_group(conn, &group.name)?;
+        let tools_json = group.tools.as_ref().map(|t| t.to_string());
+        let ttps_json = group.ttps.as_ref().map(|t| t.to_string());
+        let group_id = upsert_group(conn, &group.name, group.description.as_deref(), tools_json.as_deref(), ttps_json.as_deref())?;
         group_ids.insert(group.name.clone(), group_id);
         group_ids_lowercase.insert(group.name.to_lowercase(), group_id);
 
@@ -134,7 +124,7 @@ pub fn run_sync(conn: &Connection) -> Result<SyncStats, String> {
         for loc in &group.locations {
             if let (Some(slug), Some(fqdn)) = (&loc.slug, &loc.fqdn) {
                 let loc_type = loc.location_type.as_deref().unwrap_or("DLS");
-                upsert_location(conn, group_id, loc_type, slug, fqdn, loc.title.as_deref(), loc.available.unwrap_or(false))?;
+                upsert_location(conn, group_id, loc_type, slug, fqdn, loc.title.as_deref(), loc.available.unwrap_or(false), loc.updated.as_deref())?;
                 stats.urls += 1;
             }
         }
@@ -152,8 +142,9 @@ pub fn run_sync(conn: &Connection) -> Result<SyncStats, String> {
                 }
             }
             if let Some(profile) = &ransomlook.profile {
-                let profile_json = serde_json::to_string(profile).unwrap_or_default();
-                update_group_profile(conn, &group.name, &profile_json)?;
+                if !profile.is_empty() {
+                    append_profile_to_description(conn, &group.name, profile)?;
+                }
             }
         }
         // 100ms間隔
@@ -223,7 +214,8 @@ fn fetch_groups_ransomware_live(client: &reqwest::blocking::Client) -> Result<Ve
 fn fetch_group_ransomlook(client: &reqwest::blocking::Client, name: &str) -> Result<RansomlookGroup, String> {
     let url = format!("{}/group/{}", RANSOMLOOK_BASE, name);
     let resp = client.get(&url).send().map_err(|e| format!("API呼び出しエラー: {}", e))?;
-    resp.json().map_err(|e| format!("JSONパースエラー: {}", e))
+    let groups: Vec<RansomlookGroup> = resp.json().map_err(|e| format!("JSONパースエラー: {}", e))?;
+    groups.into_iter().next().ok_or_else(|| "グループが見つかりません".to_string())
 }
 
 fn fetch_victims_ransomware_live(client: &reqwest::blocking::Client) -> Result<Vec<Victim>, String> {
@@ -285,11 +277,15 @@ fn parse_ransom_notes_html(html: &str) -> Result<Vec<RansomNote>, String> {
 
 // === DB 操作 ===
 
-fn upsert_group(conn: &Connection, name: &str) -> Result<i64, String> {
+fn upsert_group(conn: &Connection, name: &str, description: Option<&str>, tools: Option<&str>, ttps: Option<&str>) -> Result<i64, String> {
     conn.execute(
-        "INSERT INTO groups (name) VALUES (?1)
-         ON CONFLICT(name) DO UPDATE SET updated_at = CURRENT_TIMESTAMP",
-        [name],
+        "INSERT INTO groups (name, description, tools, ttps) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(name) DO UPDATE SET
+            description = COALESCE(excluded.description, groups.description),
+            tools = COALESCE(excluded.tools, groups.tools),
+            ttps = COALESCE(excluded.ttps, groups.ttps),
+            updated_at = CURRENT_TIMESTAMP",
+        rusqlite::params![name, description, tools, ttps],
     ).map_err(|e| format!("グループ挿入エラー: {}", e))?;
 
     let id: i64 = conn.query_row("SELECT id FROM groups WHERE name = ?1", [name], |row| row.get(0))
@@ -311,24 +307,25 @@ fn update_group_contacts(conn: &Connection, name: &str, tox: Option<&str>, teleg
     Ok(())
 }
 
-fn update_group_profile(conn: &Connection, name: &str, profile: &str) -> Result<(), String> {
+fn append_profile_to_description(conn: &Connection, name: &str, profile: &[String]) -> Result<(), String> {
+    let profile_text = format!("\n\n## References\n{}", profile.iter().map(|u| format!("- {}", u)).collect::<Vec<_>>().join("\n"));
     conn.execute(
-        "UPDATE groups SET profile = ?2, updated_at = CURRENT_TIMESTAMP WHERE name = ?1",
-        [name, profile],
-    ).map_err(|e| format!("グループプロファイル更新エラー: {}", e))?;
+        "UPDATE groups SET description = COALESCE(description, '') || ?2, updated_at = CURRENT_TIMESTAMP WHERE name = ?1",
+        rusqlite::params![name, profile_text],
+    ).map_err(|e| format!("グループプロファイル追記エラー: {}", e))?;
     Ok(())
 }
 
-fn upsert_location(conn: &Connection, group_id: i64, loc_type: &str, slug: &str, fqdn: &str, title: Option<&str>, available: bool) -> Result<(), String> {
+fn upsert_location(conn: &Connection, group_id: i64, loc_type: &str, slug: &str, fqdn: &str, title: Option<&str>, available: bool, last_checked: Option<&str>) -> Result<(), String> {
     conn.execute(
         "INSERT INTO group_locations (group_id, type, slug, fqdn, title, available, last_checked_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(group_id, slug) DO UPDATE SET
             available = excluded.available,
             title = COALESCE(excluded.title, group_locations.title),
-            last_checked_at = CURRENT_TIMESTAMP,
+            last_checked_at = excluded.last_checked_at,
             updated_at = CURRENT_TIMESTAMP",
-        rusqlite::params![group_id, loc_type, slug, fqdn, title, available],
+        rusqlite::params![group_id, loc_type, slug, fqdn, title, available, last_checked],
     ).map_err(|e| format!("ロケーション挿入エラー: {}", e))?;
     Ok(())
 }
