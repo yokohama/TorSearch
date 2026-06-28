@@ -2,7 +2,7 @@
 name = "torsearch"
 version = "0.1.0"
 edition = "2024"
-description = "ランサムウェアグループの.onionサイトと被害者情報を収集・監視するツール"
+description = ".onionに散らばる、ランサムウェアグループのRansomNoteや交渉チャット等と、被害者側の情報を収集・監視するツール"
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"] }
