@@ -1,12 +1,40 @@
 use std::fs;
 use std::path::Path;
 
+mod db;
 mod sync;
 
 const DB_PATH: &str = "data/torsearch.db";
 const SCHEMA_PATH: &str = "design/sqlite-ddl.sql";
 const TEMPLATE_GROUP_DETAIL: &str = "design/templates/group_detail.md";
 const TEMPLATE_VICTIM_DETAIL: &str = "design/templates/victim_detail.md";
+
+fn print_table(columns: &[(&str, usize)], rows: &[Vec<String>]) {
+    let total_width: usize = columns.iter().map(|(_, w)| w + 3).sum::<usize>() + 1;
+    let separator = "-".repeat(total_width);
+
+    println!("{}", separator);
+
+    let header: String = columns.iter()
+        .map(|(name, width)| format!(" {:<width$} |", name, width = width))
+        .collect();
+    println!("{}", header);
+
+    println!("{}", separator);
+
+    for row in rows {
+        let line: String = row.iter()
+            .zip(columns.iter())
+            .map(|(val, (_, width))| {
+                let display: String = val.chars().take(*width).collect();
+                format!(" {:<width$} |", display, width = width)
+            })
+            .collect();
+        println!("{}", line);
+    }
+
+    println!("{}", separator);
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -114,55 +142,28 @@ fn cmd_groups(args: &[String]) {
 
     let pattern = keyword.as_ref().map(|kw| format!("%{}%", kw)).unwrap_or_else(|| "%".to_string());
 
-    let mut stmt = match conn.prepare(
-        "SELECT
-            g.id,
-            g.name,
-            COUNT(DISTINCT v.id) as victim_count,
-            COALESCE(MAX(substr(v.discovered_at, 1, 10)), '-') as last_activity,
-            COUNT(DISTINCT CASE WHEN gl.type = 'DLS' THEN gl.id END) as dls_count
-         FROM groups g
-         LEFT JOIN victims v ON g.id = v.group_id
-         LEFT JOIN group_locations gl ON g.id = gl.group_id
-         WHERE g.name LIKE ?1
-         GROUP BY g.id
-         ORDER BY last_activity DESC
-         LIMIT ?2"
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("クエリ準備エラー: {}", e);
-            return;
-        }
-    };
-
-    let rows = match stmt.query_map(rusqlite::params![pattern, limit], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-        ))
-    }) {
+    let rows = match db::list(&conn, &pattern, limit) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("クエリ実行エラー: {}", e);
+            eprintln!("{}", e);
             return;
         }
     };
 
-    println!("-------------------------------------------------------------------");
-    println!(" ID  | Group              | Victims | Last Activity | DLS Sites");
-    println!("-------------------------------------------------------------------");
+    let table_rows: Vec<Vec<String>> = rows.iter().map(|row| {
+        vec![
+            row.id.to_string(),
+            row.name.clone(),
+            row.victim_count.to_string(),
+            row.last_activity.clone(),
+            row.dls_count.to_string(),
+        ]
+    }).collect();
 
-    for row in rows {
-        if let Ok((id, name, victims, date, dls)) = row {
-            let name_display: String = name.chars().take(18).collect();
-            println!(" {:<3} | {:<18} | {:<7} | {:<13} | {}", id, name_display, victims, date, dls);
-        }
-    }
-    println!("-------------------------------------------------------------------");
+    print_table(
+        &[("ID", 3), ("Group", 18), ("Victims", 7), ("Last Activity", 13), ("DLS", 3)],
+        &table_rows,
+    );
 }
 
 fn show_group_detail(conn: &rusqlite::Connection, group_id: usize) {
@@ -174,124 +175,83 @@ fn show_group_detail(conn: &rusqlite::Connection, group_id: usize) {
         }
     };
 
-    let result: Result<(String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>), _> = conn.query_row(
-        "SELECT name, tox_id, telegram, jabber, pgp, description, tools, ttps FROM groups WHERE id = ?1",
-        [group_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
-    );
-
-    let (name, tox, telegram, jabber, pgp, description, tools, ttps) = match result {
-        Ok(r) => r,
-        Err(_) => {
-            eprintln!("グループID {} が見つかりません", group_id);
+    let group = match db::get_by_id(&conn, group_id) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("グループID {} が見つかりません: {}", group_id, e);
             return;
         }
     };
 
     // Description
-    let description_str = description.as_deref().unwrap_or("-").to_string();
+    let description_str = group.description.as_deref().unwrap_or("-").to_string();
 
     // Tools
-    let tools_str = if let Some(ref t) = tools {
-        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(t) {
-            if !arr.is_empty() {
-                let mut lines = Vec::new();
-                for obj in arr {
-                    if let Some(map) = obj.as_object() {
-                        for (category, items) in map {
-                            if let Some(arr) = items.as_array() {
-                                let tools: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-                                lines.push(format!("- **{}**: {}", category, tools.join(", ")));
-                            }
-                        }
-                    }
+    let tools_str = match group.tools.as_ref().and_then(|t| serde_json::from_str::<Vec<serde_json::Value>>(t).ok()) {
+        Some(arr) if !arr.is_empty() => {
+            let mut lines = Vec::new();
+            for obj in arr {
+                let Some(map) = obj.as_object() else { continue };
+                for (category, items) in map {
+                    let Some(arr) = items.as_array() else { continue };
+                    let tools: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                    lines.push(format!("- **{}**: {}", category, tools.join(", ")));
                 }
-                if lines.is_empty() { "-".to_string() } else { lines.join("\n") }
-            } else {
-                "-".to_string()
             }
-        } else {
-            "-".to_string()
+            if lines.is_empty() { "-".to_string() } else { lines.join("\n") }
         }
-    } else {
-        "-".to_string()
+        _ => "-".to_string(),
     };
 
     // TTPs
-    let ttps_str = if let Some(ref t) = ttps {
-        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(t) {
-            if !arr.is_empty() {
-                let mut lines = Vec::new();
-                for tactic in arr {
-                    let tactic_name = tactic.get("tactic_name").and_then(|v| v.as_str()).unwrap_or("-");
-                    let tactic_id = tactic.get("tactic_id").and_then(|v| v.as_str()).unwrap_or("-");
-                    lines.push(format!("- **{} ({})**: ", tactic_name, tactic_id));
-                    if let Some(techniques) = tactic.get("techniques").and_then(|v| v.as_array()) {
-                        let tech_names: Vec<&str> = techniques.iter()
-                            .filter_map(|t| t.get("technique_name").and_then(|v| v.as_str()))
-                            .collect();
-                        lines.push(format!("  {}", tech_names.join(", ")));
-                    }
-                }
-                if lines.is_empty() { "-".to_string() } else { lines.join("\n") }
-            } else {
-                "-".to_string()
+    let ttps_str = match group.ttps.as_ref().and_then(|t| serde_json::from_str::<Vec<serde_json::Value>>(t).ok()) {
+        Some(arr) if !arr.is_empty() => {
+            let mut lines = Vec::new();
+            for tactic in arr {
+                let tactic_name = tactic.get("tactic_name").and_then(|v| v.as_str()).unwrap_or("-");
+                let tactic_id = tactic.get("tactic_id").and_then(|v| v.as_str()).unwrap_or("-");
+                lines.push(format!("- **{} ({})**: ", tactic_name, tactic_id));
+                let Some(techniques) = tactic.get("techniques").and_then(|v| v.as_array()) else { continue };
+                let tech_names: Vec<&str> = techniques.iter()
+                    .filter_map(|t| t.get("technique_name").and_then(|v| v.as_str()))
+                    .collect();
+                lines.push(format!("  {}", tech_names.join(", ")));
             }
-        } else {
-            "-".to_string()
+            if lines.is_empty() { "-".to_string() } else { lines.join("\n") }
         }
-    } else {
-        "-".to_string()
+        _ => "-".to_string(),
     };
 
     // Sites
-    let mut stmt = conn.prepare(
-        "SELECT type, slug, title, available, last_checked_at FROM group_locations WHERE group_id = ?1 ORDER BY type, available DESC"
-    ).unwrap();
-    let sites: Vec<(String, String, Option<String>, bool, Option<String>)> = stmt.query_map([group_id], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
-
+    let sites = db::list_locations_by_group(&conn, group_id).unwrap_or_default();
     let sites_str = if !sites.is_empty() {
-        sites.iter().map(|(loc_type, url, title, available, last_checked)| {
-            let status = if *available { "UP" } else { "DOWN" };
-            let title_str = title.as_deref().unwrap_or("-");
-            let checked_str = last_checked.as_ref().map(|c| c[..10.min(c.len())].to_string()).unwrap_or("-".to_string());
-            format!("| {} | {} | {} | `{}` | {} |", loc_type, status, title_str, url, checked_str)
+        sites.iter().map(|s| {
+            let status = if s.available { "UP" } else { "DOWN" };
+            let title_str = s.title.as_deref().unwrap_or("-");
+            let checked_str = s.last_checked_at.as_ref().map(|c| c[..10.min(c.len())].to_string()).unwrap_or("-".to_string());
+            format!("| {} | {} | {} | `{}` | {} |", s.loc_type, status, title_str, s.slug, checked_str)
         }).collect::<Vec<_>>().join("\n")
     } else {
         "| - | - | - | - | - |".to_string()
     };
 
     // Ransom Notes
-    let mut stmt = conn.prepare(
-        "SELECT filename, file_type, url FROM ransom_notes WHERE group_id = ?1"
-    ).unwrap();
-    let notes: Vec<(String, String, String)> = stmt.query_map([group_id], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
-
+    let notes = db::list_ransom_notes_by_group(&conn, group_id).unwrap_or_default();
     let notes_str = if !notes.is_empty() {
-        notes.iter().map(|(filename, file_type, url)| {
-            format!("| {} | {} | {} |", filename, file_type, url)
+        notes.iter().map(|n| {
+            format!("| {} | {} | {} |", n.filename, n.file_type, n.url)
         }).collect::<Vec<_>>().join("\n")
     } else {
         "| - | - | - |".to_string()
     };
 
     // Victims
-    let mut stmt = conn.prepare(
-        "SELECT post_title, country, substr(discovered_at, 1, 10) FROM victims WHERE group_id = ?1 ORDER BY discovered_at DESC LIMIT 5"
-    ).unwrap();
-    let victims: Vec<(String, Option<String>, Option<String>)> = stmt.query_map([group_id], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
-
+    let victims = db::list_victims_by_group(&conn, group_id, 5).unwrap_or_default();
     let victims_str = if !victims.is_empty() {
-        victims.iter().map(|(name, country, date)| {
-            let c = country.as_deref().unwrap_or("-");
-            let d = date.as_deref().unwrap_or("-");
-            format!("| {} | {} | {} |", d, c, name)
+        victims.iter().map(|v| {
+            let c = v.country.as_deref().unwrap_or("-");
+            let d = v.discovered_at.as_deref().unwrap_or("-");
+            format!("| {} | {} | {} |", d, c, v.name)
         }).collect::<Vec<_>>().join("\n")
     } else {
         "| - | - | - |".to_string()
@@ -299,12 +259,12 @@ fn show_group_detail(conn: &rusqlite::Connection, group_id: usize) {
 
     // Replace placeholders
     let output = template
-        .replace("{{name}}", &name)
+        .replace("{{name}}", &group.name)
         .replace("{{id}}", &group_id.to_string())
-        .replace("{{tox}}", tox.as_deref().unwrap_or("-"))
-        .replace("{{telegram}}", telegram.as_deref().unwrap_or("-"))
-        .replace("{{jabber}}", jabber.as_deref().unwrap_or("-"))
-        .replace("{{pgp}}", &pgp.as_ref().map(|p| format!("{}...", p.chars().take(50).collect::<String>())).unwrap_or("-".to_string()))
+        .replace("{{tox}}", group.tox.as_deref().unwrap_or("-"))
+        .replace("{{telegram}}", group.telegram.as_deref().unwrap_or("-"))
+        .replace("{{jabber}}", group.jabber.as_deref().unwrap_or("-"))
+        .replace("{{pgp}}", &group.pgp.as_ref().map(|p| format!("{}...", p.chars().take(50).collect::<String>())).unwrap_or("-".to_string()))
         .replace("{{description}}", &description_str)
         .replace("{{tools}}", &tools_str)
         .replace("{{ttps}}", &ttps_str)
@@ -326,24 +286,26 @@ fn cmd_victims(args: &[String]) {
 
     // --by-country オプション
     if args.iter().any(|a| a == "--by-country") {
-        let mut stmt = conn.prepare(
-            "SELECT COALESCE(country, 'Unknown') as c, COUNT(*) as cnt
-             FROM victims
-             GROUP BY c
-             ORDER BY cnt DESC"
-        ).unwrap();
+        let rows = match db::count_by_country(&conn) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{}", e);
+                return;
+            }
+        };
 
-        let rows: Vec<(String, i64)> = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        }).unwrap().filter_map(|r| r.ok()).collect();
+        let table_rows: Vec<Vec<String>> = rows.iter().map(|row| {
+            vec![
+                row.country.clone(),
+                row.count.to_string(),
+                row.last_discovered.clone(),
+            ]
+        }).collect();
 
-        println!("-------------------------------------------------------------------");
-        println!(" Country | Count");
-        println!("-------------------------------------------------------------------");
-        for (country, count) in rows {
-            println!(" {:<7} | {}", country, count);
-        }
-        println!("-------------------------------------------------------------------");
+        print_table(
+            &[("Country", 10), ("Count", 5), ("Last Discovered", 10)],
+            &table_rows,
+        );
         return;
     }
 
@@ -354,33 +316,28 @@ fn cmd_victims(args: &[String]) {
         return;
     }
 
-    let mut stmt = conn.prepare(
-        "SELECT
-            v.id,
-            v.post_title,
-            g.name,
-            COALESCE(v.country, '-'),
-            COALESCE(substr(v.discovered_at, 1, 10), '-')
-         FROM victims v
-         JOIN groups g ON v.group_id = g.id
-         ORDER BY v.discovered_at DESC
-         LIMIT ?1"
-    ).unwrap();
+    let rows = match db::list_victims(&conn, limit) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", e);
+            return;
+        }
+    };
 
-    let rows: Vec<(i64, String, String, String, String)> = stmt.query_map([limit], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+    let table_rows: Vec<Vec<String>> = rows.iter().map(|row| {
+        vec![
+            row.id.to_string(),
+            row.name.clone(),
+            row.group_name.clone(),
+            row.country.clone(),
+            row.discovered_at.clone(),
+        ]
+    }).collect();
 
-    println!("-------------------------------------------------------------------");
-    println!(" ID   | Victim                    | Group          | Country | Date");
-    println!("-------------------------------------------------------------------");
-
-    for (id, victim, group, country, date) in rows {
-        let victim_display: String = victim.chars().take(25).collect();
-        let group_display: String = group.chars().take(14).collect();
-        println!(" {:<4} | {:<25} | {:<14} | {:<7} | {}", id, victim_display, group_display, country, date);
-    }
-    println!("-------------------------------------------------------------------");
+    print_table(
+        &[("ID", 4), ("Victim", 25), ("Group", 14), ("Country", 7), ("Date", 10)],
+        &table_rows,
+    );
 }
 
 fn show_victim_detail(conn: &rusqlite::Connection, victim_id: usize) {
@@ -392,33 +349,24 @@ fn show_victim_detail(conn: &rusqlite::Connection, victim_id: usize) {
         }
     };
 
-    let result: Result<(String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>), _> = conn.query_row(
-        "SELECT v.post_title, g.name, v.country, v.activity, v.description, v.post_url, v.website, v.discovered_at
-         FROM victims v
-         JOIN groups g ON v.group_id = g.id
-         WHERE v.id = ?1",
-        [victim_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
-    );
-
-    let (name, group, country, activity, description, post_url, website, discovered) = match result {
-        Ok(r) => r,
-        Err(_) => {
-            eprintln!("被害者ID {} が見つかりません", victim_id);
+    let victim = match db::get_victim_by_id(&conn, victim_id) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("被害者ID {} が見つかりません: {}", victim_id, e);
             return;
         }
     };
 
     let output = template
-        .replace("{{name}}", &name)
+        .replace("{{name}}", &victim.name)
         .replace("{{id}}", &victim_id.to_string())
-        .replace("{{group}}", &group)
-        .replace("{{country}}", country.as_deref().unwrap_or("-"))
-        .replace("{{activity}}", activity.as_deref().unwrap_or("-"))
-        .replace("{{discovered}}", discovered.as_deref().unwrap_or("-"))
-        .replace("{{description}}", description.as_deref().unwrap_or("-"))
-        .replace("{{post_url}}", post_url.as_deref().unwrap_or("-"))
-        .replace("{{website}}", website.as_deref().unwrap_or("-"));
+        .replace("{{group}}", &victim.group_name)
+        .replace("{{country}}", victim.country.as_deref().unwrap_or("-"))
+        .replace("{{activity}}", victim.activity.as_deref().unwrap_or("-"))
+        .replace("{{discovered}}", victim.discovered_at.as_deref().unwrap_or("-"))
+        .replace("{{description}}", victim.description.as_deref().unwrap_or("-"))
+        .replace("{{post_url}}", victim.post_url.as_deref().unwrap_or("-"))
+        .replace("{{website}}", victim.website.as_deref().unwrap_or("-"));
 
     print!("{}", output);
 }
@@ -444,25 +392,27 @@ fn parse_args(args: &[String], default_limit: usize) -> (usize, Option<usize>, O
 }
 
 fn show_tools_summary(conn: &rusqlite::Connection) {
-    let mut stmt = conn.prepare("SELECT tools FROM groups WHERE tools IS NOT NULL AND tools != '[]'").unwrap();
-    let rows: Vec<String> = stmt.query_map([], |row| row.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+    let rows = match db::get_tools_json(conn) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", e);
+            return;
+        }
+    };
 
     let mut tool_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for tools_json in rows {
-        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&tools_json) {
-            for obj in arr {
-                if let Some(map) = obj.as_object() {
-                    for (category, items) in map {
-                        if let Some(tools) = items.as_array() {
-                            for tool in tools {
-                                if let Some(name) = tool.as_str() {
-                                    let key = format!("{}: {}", category, name);
-                                    *tool_counts.entry(key).or_insert(0) += 1;
-                                }
-                            }
-                        }
-                    }
+        let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&tools_json) else { continue };
+
+        for obj in arr {
+            let Some(map) = obj.as_object() else { continue };
+            for (category, items) in map {
+                let Some(tools) = items.as_array() else { continue };
+                for tool in tools {
+                    let Some(name) = tool.as_str() else { continue };
+                    let key = format!("{}: {}", category, name);
+                    *tool_counts.entry(key).or_insert(0) += 1;
                 }
             }
         }
@@ -471,33 +421,38 @@ fn show_tools_summary(conn: &rusqlite::Connection) {
     let mut sorted: Vec<_> = tool_counts.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
 
-    println!("-------------------------------------------------------------------");
-    println!(" Tool                                              | Groups");
-    println!("-------------------------------------------------------------------");
-    for (tool, count) in sorted.iter().take(30) {
-        let tool_display: String = tool.chars().take(50).collect();
-        println!(" {:<50} | {}", tool_display, count);
-    }
-    println!("-------------------------------------------------------------------");
+    let table_rows: Vec<Vec<String>> = sorted.iter()
+        .take(30)
+        .map(|(tool, count)| vec![tool.clone(), count.to_string()])
+        .collect();
+
+    print_table(
+        &[("Tool", 50), ("Groups", 6)],
+        &table_rows,
+    );
 }
 
 fn show_ttps_summary(conn: &rusqlite::Connection) {
-    let mut stmt = conn.prepare("SELECT ttps FROM groups WHERE ttps IS NOT NULL AND ttps != '[]'").unwrap();
-    let rows: Vec<String> = stmt.query_map([], |row| row.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+    let rows = match db::get_ttps_json(conn) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", e);
+            return;
+        }
+    };
 
     let mut ttp_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for ttps_json in rows {
-        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&ttps_json) {
-            for tactic in arr {
-                if let Some(techniques) = tactic.get("techniques").and_then(|v| v.as_array()) {
-                    for tech in techniques {
-                        let id = tech.get("technique_id").and_then(|v| v.as_str()).unwrap_or("-");
-                        let name = tech.get("technique_name").and_then(|v| v.as_str()).unwrap_or("-");
-                        let key = format!("{} {}", id, name);
-                        *ttp_counts.entry(key).or_insert(0) += 1;
-                    }
-                }
+        let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&ttps_json) else { continue };
+
+        for tactic in arr {
+            let Some(techniques) = tactic.get("techniques").and_then(|v| v.as_array()) else { continue };
+            for tech in techniques {
+                let id = tech.get("technique_id").and_then(|v| v.as_str()).unwrap_or("-");
+                let name = tech.get("technique_name").and_then(|v| v.as_str()).unwrap_or("-");
+                let key = format!("{} {}", id, name);
+                *ttp_counts.entry(key).or_insert(0) += 1;
             }
         }
     }
@@ -505,12 +460,13 @@ fn show_ttps_summary(conn: &rusqlite::Connection) {
     let mut sorted: Vec<_> = ttp_counts.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
 
-    println!("-------------------------------------------------------------------");
-    println!(" TTP                                               | Groups");
-    println!("-------------------------------------------------------------------");
-    for (ttp, count) in sorted.iter().take(30) {
-        let ttp_display: String = ttp.chars().take(50).collect();
-        println!(" {:<50} | {}", ttp_display, count);
-    }
-    println!("-------------------------------------------------------------------");
+    let table_rows: Vec<Vec<String>> = sorted.iter()
+        .take(30)
+        .map(|(ttp, count)| vec![ttp.clone(), count.to_string()])
+        .collect();
+
+    print_table(
+        &[("TTP", 50), ("Groups", 6)],
+        &table_rows,
+    );
 }
