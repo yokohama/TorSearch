@@ -12,8 +12,9 @@ pub use location::{
     list_by_group as list_locations_by_group
 };
 pub use ransom_note::{
-    upsert as upsert_ransom_note, 
-    list_by_group as list_ransom_notes_by_group
+    upsert as upsert_ransom_note,
+    list_by_group as list_ransom_notes_by_group,
+    list as list_ransom_notes,
 };
 pub use victim::{
     upsert as upsert_victim,

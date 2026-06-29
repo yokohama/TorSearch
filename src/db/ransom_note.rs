@@ -48,3 +48,35 @@ pub fn list_by_group(conn: &Connection, group_id: usize) -> Result<Vec<RansomNot
 
     Ok(rows)
 }
+
+pub struct NoteWithGroup {
+    pub group_id: i64,
+    pub group_name: String,
+    pub url: String,
+}
+
+pub fn list(conn: &Connection, limit: usize) -> Result<Vec<NoteWithGroup>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.group_id, g.name, r.url
+             FROM ransom_notes r
+             JOIN groups g ON r.group_id = g.id
+             ORDER BY r.id DESC
+             LIMIT ?1",
+        )
+        .map_err(|e| format!("クエリ準備エラー: {}", e))?;
+
+    let rows = stmt
+        .query_map([limit], |row| {
+            Ok(NoteWithGroup {
+                group_id: row.get(0)?,
+                group_name: row.get(1)?,
+                url: row.get(2)?,
+            })
+        })
+        .map_err(|e| format!("クエリ実行エラー: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(rows)
+}

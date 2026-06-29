@@ -9,6 +9,11 @@ pub struct GroupRow {
     pub victim_count: i64,
     pub last_activity: String,
     pub dls_count: i64,
+    pub note_count: i64,
+    pub has_tox: bool,
+    pub has_telegram: bool,
+    pub has_jabber: bool,
+    pub has_pgp: bool,
 }
 
 /// グループ詳細表示用
@@ -65,10 +70,16 @@ pub fn list(
                 g.name,
                 COUNT(DISTINCT v.id) as victim_count,
                 COALESCE(MAX(substr(v.discovered_at, 1, 10)), '-') as last_activity,
-                COUNT(DISTINCT CASE WHEN gl.type = 'DLS' THEN gl.id END) as dls_count
+                COUNT(DISTINCT CASE WHEN gl.type = 'DLS' THEN gl.id END) as dls_count,
+                COUNT(DISTINCT rn.id) as note_count,
+                g.tox_id IS NOT NULL as has_tox,
+                g.telegram IS NOT NULL as has_telegram,
+                g.jabber IS NOT NULL as has_jabber,
+                g.pgp IS NOT NULL as has_pgp
              FROM groups g
              LEFT JOIN victims v ON g.id = v.group_id
              LEFT JOIN group_locations gl ON g.id = gl.group_id
+             LEFT JOIN ransom_notes rn ON g.id = rn.group_id
              WHERE g.name LIKE ?1
              GROUP BY g.id
              ORDER BY last_activity DESC
@@ -84,6 +95,11 @@ pub fn list(
                 victim_count: row.get(2)?,
                 last_activity: row.get(3)?,
                 dls_count: row.get(4)?,
+                note_count: row.get(5)?,
+                has_tox: row.get(6)?,
+                has_telegram: row.get(7)?,
+                has_jabber: row.get(8)?,
+                has_pgp: row.get(9)?,
             })
         })
         .map_err(|e| format!("クエリ実行エラー: {}", e))?

@@ -26,7 +26,7 @@ fn print_table(columns: &[(&str, usize)], rows: &[Vec<String>]) {
         let line: String = row.iter()
             .zip(columns.iter())
             .map(|(val, (_, width))| {
-                let display: String = val.chars().take(*width).collect();
+                let display = truncate(val, *width);
                 format!(" {:<width$} |", display, width = width)
             })
             .collect();
@@ -34,6 +34,18 @@ fn print_table(columns: &[(&str, usize)], rows: &[Vec<String>]) {
     }
 
     println!("{}", separator);
+}
+
+fn truncate(s: &str, max_width: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_width {
+        s.to_string()
+    } else if max_width <= 3 {
+        s.chars().take(max_width).collect()
+    } else {
+        let truncated: String = s.chars().take(max_width - 3).collect();
+        format!("{}...", truncated)
+    }
 }
 
 fn main() {
@@ -48,6 +60,7 @@ fn main() {
         "sync" => cmd_sync(),
         "groups" => cmd_groups(&args[2..]),
         "victims" => cmd_victims(&args[2..]),
+        "notes" => cmd_notes(&args[2..]),
         _ => print_usage(),
     }
 }
@@ -56,12 +69,13 @@ fn print_usage() {
     println!("Usage: torsearch <command> [options]");
     println!();
     println!("Commands:");
-    println!("  sync              APIからデータを同期 (初回はDB自動作成)");
-    println!("  groups [-N] [id]  グループ一覧/詳細/検索");
+    println!("  sync                  APIからデータを同期 (初回はDB自動作成)");
+    println!("  groups [-N] [id]      グループ一覧/詳細/検索");
     println!("  groups --by-tools     ツール別集計");
     println!("  groups --by-ttps      TTPs別集計");
-    println!("  victims [-N] [id] 被害者一覧/詳細");
+    println!("  victims [-N] [id]     被害者一覧/詳細");
     println!("  victims --by-country  国別集計");
+    println!("  notes [-N]            ランサムノート一覧");
 }
 
 fn cmd_sync() {
@@ -157,11 +171,16 @@ fn cmd_groups(args: &[String]) {
             row.victim_count.to_string(),
             row.last_activity.clone(),
             row.dls_count.to_string(),
+            row.note_count.to_string(),
+            if row.has_tox { "Y" } else { "-" }.to_string(),
+            if row.has_telegram { "Y" } else { "-" }.to_string(),
+            if row.has_jabber { "Y" } else { "-" }.to_string(),
+            if row.has_pgp { "Y" } else { "-" }.to_string(),
         ]
     }).collect();
 
     print_table(
-        &[("ID", 3), ("Group", 18), ("Victims", 7), ("Last Activity", 13), ("DLS", 3)],
+        &[("ID", 3), ("Group", 18), ("Victims", 7), ("Last Activity", 13), ("DLS", 3), ("Notes", 5), ("TOX", 3), ("TG", 2), ("JBR", 3), ("PGP", 3)],
         &table_rows,
     );
 }
@@ -467,6 +486,39 @@ fn show_ttps_summary(conn: &rusqlite::Connection) {
 
     print_table(
         &[("TTP", 50), ("Groups", 6)],
+        &table_rows,
+    );
+}
+
+fn cmd_notes(args: &[String]) {
+    let conn = match rusqlite::Connection::open(DB_PATH) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("DB接続エラー: {}", e);
+            return;
+        }
+    };
+
+    let (limit, _, _) = parse_args(args, 50);
+
+    let rows = match db::list_ransom_notes(&conn, limit) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", e);
+            return;
+        }
+    };
+
+    let table_rows: Vec<Vec<String>> = rows.iter().map(|row| {
+        vec![
+            row.group_id.to_string(),
+            row.group_name.clone(),
+            row.url.clone(),
+        ]
+    }).collect();
+
+    print_table(
+        &[("ID", 3), ("Group", 18), ("URL", 80)],
         &table_rows,
     );
 }

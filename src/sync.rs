@@ -44,13 +44,7 @@ pub struct Location {
 #[derive(Debug, Deserialize)]
 pub struct RansomlookGroup {
     #[serde(default)]
-    pub meta: Option<String>,
-    #[serde(default)]
     pub profile: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RansomlookMeta {
     #[serde(default)]
     pub tox: Option<String>,
     #[serde(default)]
@@ -139,10 +133,12 @@ pub fn run_sync(conn: &Connection) -> Result<SyncStats, String> {
     for (i, group) in groups.iter().enumerate() {
         let Ok(ransomlook) = fetch_group_ransomlook(&client, &group.name) else { continue };
 
-        if let Some(meta_str) = &ransomlook.meta {
-            if let Ok(meta) = serde_json::from_str::<RansomlookMeta>(meta_str) {
-                db::update_contacts(conn, &group.name, meta.tox.as_deref(), meta.telegram.as_deref(), meta.jabber.as_deref(), meta.pgp.as_deref())?;
-            }
+        let tox = ransomlook.tox.as_deref().filter(|s| !s.is_empty());
+        let telegram = ransomlook.telegram.as_deref().filter(|s| !s.is_empty());
+        let jabber = ransomlook.jabber.as_deref().filter(|s| !s.is_empty());
+        let pgp = ransomlook.pgp.as_deref().filter(|s| !s.is_empty());
+        if tox.is_some() || telegram.is_some() || jabber.is_some() || pgp.is_some() {
+            db::update_contacts(conn, &group.name, tox, telegram, jabber, pgp)?;
         }
         if let Some(profile) = &ransomlook.profile {
             if !profile.is_empty() {
@@ -165,7 +161,7 @@ pub fn run_sync(conn: &Connection) -> Result<SyncStats, String> {
 
     for victim in &victims {
         let group_name = victim.group_name.as_deref().unwrap_or("");
-        if let Some(&group_id) = group_ids.get(group_name) {
+        if let Some(&group_id) = group_ids_lowercase.get(&group_name.to_lowercase()) {
             let name = victim.name.as_deref().unwrap_or("");
             if !name.is_empty() {
                 let victim_data = db::VictimData {
@@ -241,8 +237,9 @@ fn fetch_group_ransomlook(client: &reqwest::blocking::Client, name: &str) -> Res
         return Err(format!("HTTPエラー [{}]: {}", url, status));
     }
 
-    let groups: Vec<RansomlookGroup> = resp.json().map_err(|e| format!("JSONパースエラー [{}]: {:?}", url, e))?;
-    groups.into_iter().next().ok_or_else(|| format!("グループが見つかりません [{}]", url))
+    let arr: Vec<serde_json::Value> = resp.json().map_err(|e| format!("JSONパースエラー [{}]: {:?}", url, e))?;
+    let first = arr.into_iter().next().ok_or_else(|| format!("グループが見つかりません [{}]", url))?;
+    serde_json::from_value(first).map_err(|e| format!("グループパースエラー [{}]: {:?}", url, e))
 }
 
 fn fetch_victims_ransomware_live(client: &reqwest::blocking::Client) -> Result<Vec<Victim>, String> {

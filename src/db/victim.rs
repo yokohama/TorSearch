@@ -50,7 +50,16 @@ pub fn upsert(conn: &Connection, group_id: i64, victim: &VictimData) -> Result<(
             post_url, website, screenshot_url, data_size, ransom,
             discovered_at, published_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-         ON CONFLICT DO NOTHING",
+         ON CONFLICT(group_id, post_url) DO UPDATE SET
+            post_title = COALESCE(excluded.post_title, victims.post_title),
+            country = COALESCE(excluded.country, victims.country),
+            activity = COALESCE(excluded.activity, victims.activity),
+            description = COALESCE(excluded.description, victims.description),
+            website = COALESCE(excluded.website, victims.website),
+            screenshot_url = COALESCE(excluded.screenshot_url, victims.screenshot_url),
+            data_size = COALESCE(excluded.data_size, victims.data_size),
+            ransom = COALESCE(excluded.ransom, victims.ransom),
+            updated_at = CURRENT_TIMESTAMP",
         rusqlite::params![
             group_id,
             victim.name,
